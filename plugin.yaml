@@ -1,0 +1,9 @@
+name: hermes-web-crawl4ai
+version: 0.1.0
+description: "Self-hosted Crawl4AI extraction backend and bounded crawl tool for Hermes."
+author: axAilotl
+kind: backend
+provides_web_providers:
+  - crawl4ai
+provides_tools:
+  - crawl4ai_crawl
