@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import threading
 from functools import lru_cache
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -171,71 +172,175 @@ async def _extract_pdf(url: str) -> dict[str, Any]:
 
 _SCRAPLING_SPEC = "scrapling[fetchers]==0.4.14"
 _SCRAPLING_INSTALL_ENV = "HERMES_WEB_CRAWL4AI_NO_INSTALL"
+_SCRAPLING_INSTALL_TIMEOUT_SECONDS = 600
+
+# Single-flight resolution: the first caller installs; everyone else waits on
+# the lock and reuses the outcome. Failed installs are cached for the process
+# lifetime (retrying pip on every challenge would hammer a broken index).
+_scrapling_lock = threading.Lock()
+_scrapling_state: dict[str, Any] = {"resolved": False, "fetcher": None}
 
 
-def _import_scrapling_fetcher():
-    """Import scrapling's StealthyFetcher, self-installing on first miss.
+def _no_install_requested() -> bool:
+    value = os.environ.get(_SCRAPLING_INSTALL_ENV, "").strip().casefold()
+    return value not in ("", "0", "false", "no")
 
-    The plugin owns its stealth-escalation dependency (core's lazy-deps
-    allowlist is reserved for in-core backends — see core's
-    ``tools/lazy_deps.py`` contract and the plugin developer guide). On
-    ImportError we pip-install the pinned spec into ``sys.executable``'s
-    environment once, then retry the import. Set
-    ``HERMES_WEB_CRAWL4AI_NO_INSTALL=1`` to forbid runtime installs (locked
-   down hosts); the stealth leg then reports unavailable, as before.
+
+def _pip_env() -> dict[str, str]:
+    """Environment for the pip child: ambient vars minus pip/python overrides.
+
+    ``PIP_*`` variables can redirect the index, target dir, or trusted hosts;
+    ``PYTHONPATH``/``PYTHONHOME`` can change what the child interpreter
+    imports. Strip all three (pip also runs with ``--isolated`` so its own
+    config files are ignored) while keeping PATH/HOME/locale for TLS and
+    filesystem sanity.
     """
-    try:
-        from scrapling import StealthyFetcher  # noqa: F401
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("PIP_")
+        and key.upper() not in ("PYTHONPATH", "PYTHONHOME")
+    }
+    env["PIP_NO_INPUT"] = "1"
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    return env
 
-        return StealthyFetcher
-    except ImportError:
-        pass
 
-    if os.environ.get(_SCRAPLING_INSTALL_ENV, "").strip() not in ("", "0", "false"):
-        logger.info(
-            "%s set — skipping scrapling self-install; stealth escalation unavailable",
-            _SCRAPLING_INSTALL_ENV,
-        )
-        return None
+def _redact(text: str) -> str:
+    """Best-effort sanitizer for pip diagnostics: strip URLs and token-shaped
+    runs before logging a bounded tail."""
+    text = re.sub(r"https?://\S+", "<url>", text)
+    text = re.sub(r"[A-Za-z0-9_+=.-]{24,}", "<token>", text)
+    return text[-300:]
 
-    import subprocess
-    import sys
 
-    logger.info("Installing %s for stealth escalation (one-time)…", _SCRAPLING_SPEC)
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", _SCRAPLING_SPEC],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-    except Exception as exc:  # noqa: BLE001 — any failure just disables the leg
-        logger.warning("scrapling self-install failed: %s", exc)
-        return None
-    if proc.returncode != 0:
-        logger.warning(
-            "scrapling self-install failed (rc=%d): %s", proc.returncode, proc.stderr[-800:]
-        )
-        return None
+def _try_import_scrapling() -> Optional[Any]:
+    """Return StealthyFetcher, or None when missing OR broken.
+
+    A partially broken install can raise things other than ImportError while
+    resolving the attribute (RuntimeError, OSError, …) — treat any ordinary
+    import-time failure as unavailable rather than letting it escape.
+    """
     try:
         from scrapling import StealthyFetcher
 
         return StealthyFetcher
-    except ImportError:
-        logger.warning("scrapling still unimportable after self-install")
+    except Exception:  # noqa: BLE001 — missing or broken both mean unavailable
         return None
+
+
+def _pip_install_scrapling() -> bool:
+    """Run the one-time pinned install. Returns True on pip success."""
+    import subprocess
+    import sys
+
+    argv = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--isolated",
+        "--no-input",
+        "--quiet",
+        _SCRAPLING_SPEC,
+    ]
+    logger.info("Installing %s for stealth escalation (one-time)…", _SCRAPLING_SPEC)
+    lock_file = None
+    try:
+        # Best-effort inter-process lock so two gateway processes can't race
+        # pip against the same environment. Platforms without fcntl (or a
+        # unwritable temp dir) degrade to the in-process lock alone.
+        import fcntl
+        import tempfile
+
+        lock_path = os.path.join(tempfile.gettempdir(), "hermes-web-crawl4ai-scrapling.lock")
+        lock_file = open(lock_path, "a")  # noqa: SIM115 — held for the install
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    except Exception:  # noqa: BLE001 — locking is best-effort
+        lock_file = None
+
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_SCRAPLING_INSTALL_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
+            env=_pip_env(),
+        )
+    except FileNotFoundError:
+        logger.warning("scrapling self-install failed: pip is not available in this environment")
+        return False
+    except Exception as exc:  # noqa: BLE001 — any failure just disables the leg
+        logger.warning("scrapling self-install failed: %s", exc)
+        return False
+    finally:
+        if lock_file is not None:
+            try:
+                import fcntl as _fcntl
+
+                _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                lock_file.close()
+            except Exception:  # noqa: BLE001
+                pass
+    if proc.returncode != 0:
+        logger.warning(
+            "scrapling self-install failed (rc=%d): %s",
+            proc.returncode,
+            _redact(proc.stderr or ""),
+        )
+        return False
+    return True
+
+
+def _resolve_scrapling_fetcher():
+    """Import StealthyFetcher, self-installing the pinned spec on first miss.
+
+    The plugin owns its stealth-escalation dependency (core's lazy-deps
+    allowlist is reserved for in-core backends — see core's
+    ``tools/lazy_deps.py`` contract and the plugin developer guide).
+
+    Contract: single-flight per process (thread lock; best-effort inter-
+    process lock around pip itself); the outcome — including a FAILED
+    install — is cached for the process lifetime; any import-time failure
+    (missing or broken package) counts as unavailable. Call this from a
+    worker thread (``asyncio.to_thread``) — the pip run may take minutes on
+    a cold host. ``HERMES_WEB_CRAWL4AI_NO_INSTALL`` (any casing of a
+    truthy value) skips the runtime install; if scrapling is already
+    importable, stealth still works — the switch only forbids installing.
+    """
+    with _scrapling_lock:
+        if _scrapling_state["resolved"]:
+            return _scrapling_state["fetcher"]
+
+        fetcher = _try_import_scrapling()
+        if fetcher is None and not _no_install_requested():
+            if _pip_install_scrapling():
+                import importlib
+
+                importlib.invalidate_caches()
+                fetcher = _try_import_scrapling()
+                if fetcher is None:
+                    logger.warning("scrapling still unimportable after a successful self-install")
+
+        _scrapling_state["resolved"] = True
+        _scrapling_state["fetcher"] = fetcher
+        return fetcher
 
 
 async def _stealth_fetch(url: str) -> Optional[dict[str, Any]]:
     """Last-resort stealth fetch via scrapling when the content gate flags a
     challenge/block. Runs in-process (not Docker), so it also covers a downed
-    Crawl4AI container. scrapling's StealthyFetcher is synchronous (patchright
-    sync API), so it runs in a worker thread. Returns None on any failure.
+    Crawl4AI container. scrapling's StealthyFetcher is synchronous, so it runs
+    in a worker thread. Returns None on any failure.
 
-    Browser engines (chromium via patchright) are provisioned separately by
-    ``scrapling install`` after the first self-install — see README."""
-
-    fetcher_cls = _import_scrapling_fetcher()
+    Browser engines are provisioned separately — after the first install, run
+    ``scrapling install`` once (see scrapling's docs) — see README."""
+    # Resolver may run pip (minutes on a cold host): keep it off the event loop.
+    fetcher_cls = await asyncio.to_thread(_resolve_scrapling_fetcher)
     if fetcher_cls is None:
         return None
 

@@ -13,13 +13,17 @@ plugin registry while compatibility testing is underway.
 When the content-quality gate flags a challenge/block (e.g. a Cloudflare
 wall) or the Crawl4AI container is down, the plugin falls back to an
 in-process stealth fetch via [scrapling]. The pinned dependency
-`scrapling[fetchers]==0.4.14` self-installs on first use (disable with
-`HERMES_WEB_CRAWL4AI_NO_INSTALL=1`), or install eagerly with:
+`scrapling[fetchers]==0.4.14` self-installs on first use (set
+`HERMES_WEB_CRAWL4AI_NO_INSTALL=1` to forbid runtime installs — note this
+only disables *installing*: if scrapling is already importable, stealth
+still runs), or install eagerly with:
 
     pip install -e ".[stealth]"
 
 After the first install, provision the browser engines once with
-`scrapling install` (fetches chromium via patchright).
+`scrapling install` (scrapling's installer drives the Playwright CLI to
+fetch chromium; the stealth fetcher itself runs on patchright, which
+shares Playwright's browser cache).
 
 [scrapling]: https://scrapling.readthedocs.io/
 
