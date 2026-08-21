@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from functools import lru_cache
 from typing import Any, Optional
@@ -168,24 +169,78 @@ async def _extract_pdf(url: str) -> dict[str, Any]:
     }
 
 
+_SCRAPLING_SPEC = "scrapling[fetchers]==0.4.14"
+_SCRAPLING_INSTALL_ENV = "HERMES_WEB_CRAWL4AI_NO_INSTALL"
+
+
+def _import_scrapling_fetcher():
+    """Import scrapling's StealthyFetcher, self-installing on first miss.
+
+    The plugin owns its stealth-escalation dependency (core's lazy-deps
+    allowlist is reserved for in-core backends — see core's
+    ``tools/lazy_deps.py`` contract and the plugin developer guide). On
+    ImportError we pip-install the pinned spec into ``sys.executable``'s
+    environment once, then retry the import. Set
+    ``HERMES_WEB_CRAWL4AI_NO_INSTALL=1`` to forbid runtime installs (locked
+   down hosts); the stealth leg then reports unavailable, as before.
+    """
+    try:
+        from scrapling import StealthyFetcher  # noqa: F401
+
+        return StealthyFetcher
+    except ImportError:
+        pass
+
+    if os.environ.get(_SCRAPLING_INSTALL_ENV, "").strip() not in ("", "0", "false"):
+        logger.info(
+            "%s set — skipping scrapling self-install; stealth escalation unavailable",
+            _SCRAPLING_INSTALL_ENV,
+        )
+        return None
+
+    import subprocess
+    import sys
+
+    logger.info("Installing %s for stealth escalation (one-time)…", _SCRAPLING_SPEC)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", _SCRAPLING_SPEC],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except Exception as exc:  # noqa: BLE001 — any failure just disables the leg
+        logger.warning("scrapling self-install failed: %s", exc)
+        return None
+    if proc.returncode != 0:
+        logger.warning(
+            "scrapling self-install failed (rc=%d): %s", proc.returncode, proc.stderr[-800:]
+        )
+        return None
+    try:
+        from scrapling import StealthyFetcher
+
+        return StealthyFetcher
+    except ImportError:
+        logger.warning("scrapling still unimportable after self-install")
+        return None
+
+
 async def _stealth_fetch(url: str) -> Optional[dict[str, Any]]:
     """Last-resort stealth fetch via scrapling when the content gate flags a
     challenge/block. Runs in-process (not Docker), so it also covers a downed
     Crawl4AI container. scrapling's StealthyFetcher is synchronous (patchright
-    sync API), so it runs in a worker thread. Returns None on any failure."""
-    try:
-        from tools.lazy_deps import ensure as _lazy_ensure
+    sync API), so it runs in a worker thread. Returns None on any failure.
 
-        _lazy_ensure("search.scrapling", prompt=False)
-    except Exception:  # noqa: BLE001 — core may not know search.scrapling yet
-        pass
-    try:
-        from scrapling import StealthyFetcher
-    except Exception:  # noqa: BLE001 — scrapling not installed / unavailable
+    Browser engines (chromium via patchright) are provisioned separately by
+    ``scrapling install`` after the first self-install — see README."""
+
+    fetcher_cls = _import_scrapling_fetcher()
+    if fetcher_cls is None:
         return None
 
     def _run() -> str:
-        fetcher = StealthyFetcher()
+        fetcher = fetcher_cls()
         page = fetcher.fetch(
             url,
             headless=True,

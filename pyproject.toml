@@ -28,6 +28,11 @@ Issues = "https://github.com/axAilotl/hermes-web-crawl4ai/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.23,<2", "ruff>=0.9,<1"]
+# Stealth-escalation leg (challenge/block fallback fetch). The plugin also
+# self-installs this pin at runtime on first use; the extra is for hosts that
+# prefer eager/declarative installs. Browser engines are provisioned
+# separately via `scrapling install` (chromium via patchright).
+stealth = ["scrapling[fetchers]==0.4.14"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["hermes_web_crawl4ai"]

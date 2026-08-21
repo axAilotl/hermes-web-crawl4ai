@@ -8,6 +8,21 @@ This is the standalone continuation of the Crawl4AI work from
 It intentionally makes no changes to Hermes core and is not listed in a Hermes
 plugin registry while compatibility testing is underway.
 
+### Stealth escalation (optional)
+
+When the content-quality gate flags a challenge/block (e.g. a Cloudflare
+wall) or the Crawl4AI container is down, the plugin falls back to an
+in-process stealth fetch via [scrapling]. The pinned dependency
+`scrapling[fetchers]==0.4.14` self-installs on first use (disable with
+`HERMES_WEB_CRAWL4AI_NO_INSTALL=1`), or install eagerly with:
+
+    pip install -e ".[stealth]"
+
+After the first install, provision the browser engines once with
+`scrapling install` (fetches chromium via patchright).
+
+[scrapling]: https://scrapling.readthedocs.io/
+
 ## What it provides
 
 - `crawl4ai`, an extract-only `WebSearchProvider` used by Hermes' existing
