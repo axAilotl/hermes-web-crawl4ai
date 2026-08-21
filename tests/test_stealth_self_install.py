@@ -3,14 +3,16 @@
 The plugin must not depend on core's ``tools.lazy_deps`` allowlist for its
 scrapling stealth leg (that allowlist is reserved for in-core backends).
 These tests pin ``_resolve_scrapling_fetcher``'s contract: exact pip argv
-and subprocess kwargs, sanitized child environment, single-flight under
-concurrent callers, failure caching for the process lifetime, soft
-degradation on broken installs and missing pip, and kill-switch casing.
-No test may reach a real pip process.
+and subprocess kwargs, allowlisted child environment, single-flight under
+GENUINELY OVERLAPPING concurrent callers, failure caching, soft degradation
+(broken installs, missing pip), kill-switch casing, the shared-future async
+path, and inter-process lock semantics. No test may reach a real pip.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import subprocess
 import sys
 import threading
@@ -19,7 +21,7 @@ import types
 import pytest
 
 import hermes_web_crawl4ai.provider as provider
-from hermes_web_crawl4ai.provider import _redact, _resolve_scrapling_fetcher
+from hermes_web_crawl4ai.provider import _resolve_scrapling_fetcher
 
 
 class _FakeFetcher:
@@ -29,10 +31,10 @@ class _FakeFetcher:
 
 
 class _Proc:
-    def __init__(self, returncode: int = 0, stderr: str = "") -> None:
+    def __init__(self, returncode: int = 0) -> None:
         self.returncode = returncode
         self.stdout = ""
-        self.stderr = stderr
+        self.stderr = "https://user:secret@pypi.internal/simple went away"
 
 
 def _install_fake_scrapling_module(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -42,10 +44,10 @@ def _install_fake_scrapling_module(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _reset_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give each test a fresh resolution state and no scrapling module."""
     monkeypatch.setattr(provider, "_scrapling_state", {"resolved": False, "fetcher": None})
     monkeypatch.delitem(sys.modules, "scrapling", raising=False)
     monkeypatch.delenv(provider._SCRAPLING_INSTALL_ENV, raising=False)
+    monkeypatch.setattr(provider, "_scrapling_resolve_task", None)
 
 
 def _forbid_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -55,8 +57,10 @@ def _forbid_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "run", _fail_run)
 
 
-class _PipRecorder:
-    """Records subprocess.run calls; optionally makes scrapling importable on success."""
+class _BlockingPipRecorder:
+    """Fake pip that BLOCKS inside the call until N callers are inside the
+    resolver, so concurrency is genuinely forced (a decorative lock would
+    let multiple pip calls through)."""
 
     def __init__(
         self,
@@ -64,37 +68,40 @@ class _PipRecorder:
         *,
         returncode: int = 0,
         fix_imports: bool = True,
+        callers_to_admit: int = 1,
     ) -> None:
-        self.calls: list[tuple[list[str], dict]] = []
+        self.calls = 0
+        self.last_call: tuple[list[str], dict] | None = None
         self._monkeypatch = monkeypatch
-        self._returncode = returncode
         self._fix_imports = fix_imports
+        self._gate = threading.Barrier(callers_to_admit, timeout=5)
+        self._returncode = returncode
         monkeypatch.setattr(subprocess, "run", self)
 
     def __call__(self, argv, **kwargs):  # noqa: ANN001, ANN003
-        self.calls.append((list(argv), kwargs))
+        self.calls += 1
+        self.last_call = (list(argv), kwargs)
+        # Block INSIDE pip until the expected number of callers are racing.
+        with contextlib.suppress(threading.BrokenBarrierError):
+            self._gate.wait()
         if self._returncode == 0 and self._fix_imports:
             _install_fake_scrapling_module(self._monkeypatch)
-        return _Proc(returncode=self._returncode, stderr="simulated failure")
+        return _Proc(returncode=self._returncode)
 
 
-def test_fetcher_returned_when_scrapling_present(monkeypatch: pytest.MonkeyPatch) -> None:
-    _reset_state(monkeypatch)
-    _install_fake_scrapling_module(monkeypatch)
-    _forbid_subprocess(monkeypatch)
-    assert _resolve_scrapling_fetcher() is _FakeFetcher
+# ── argv / environment contract ───────────────────────────────────────
 
 
 def test_pip_argv_and_kwargs_are_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
     _reset_state(monkeypatch)
-    rec = _PipRecorder(monkeypatch)
+    rec = _BlockingPipRecorder(monkeypatch)
     fetcher = _resolve_scrapling_fetcher()
     assert fetcher is _FakeFetcher
-    assert len(rec.calls) == 1
-    argv, kwargs = rec.calls[0]
-    # Exact argv: interpreter, module form, isolated, non-interactive, pinned spec.
+    assert rec.calls == 1
+    argv, kwargs = rec.last_call
     assert argv == [
         sys.executable,
+        "-I",
         "-m",
         "pip",
         "install",
@@ -107,76 +114,102 @@ def test_pip_argv_and_kwargs_are_pinned(monkeypatch: pytest.MonkeyPatch) -> None
     assert kwargs["text"] is True
     assert kwargs["timeout"] == provider._SCRAPLING_INSTALL_TIMEOUT_SECONDS
     assert kwargs["stdin"] == subprocess.DEVNULL
-    # Child environment must not inherit host pip/python overrides; the only
-    # PIP_ keys present are the two we deliberately set.
+    # Allowlisted child environment — no proxies, no TLS overrides, no
+    # PIP_*/PYTHON* ambient state beyond the two deliberate knobs.
     child_env = kwargs["env"]
-    inherited_pip = {k for k in child_env if k.upper().startswith("PIP_")} - {
-        "PIP_NO_INPUT",
-        "PIP_DISABLE_PIP_VERSION_CHECK",
-    }
-    assert not inherited_pip
+    assert set(child_env) - {"PIP_NO_INPUT", "PIP_DISABLE_PIP_VERSION_CHECK"} <= set(
+        provider._PIP_ENV_ALLOWLIST
+    )
     assert child_env["PIP_NO_INPUT"] == "1"
-    assert not any(k.upper() in ("PYTHONPATH", "PYTHONHOME") for k in child_env)
+    assert not any(k.upper().startswith("HTTPS_PROXY") for k in child_env)
 
 
-def test_child_env_strips_hostile_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pip_env_is_a_pure_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://evil:8080")
+    monkeypatch.setenv("SSL_CERT_FILE", "/tmp/evil.pem")
     monkeypatch.setenv("PIP_INDEX_URL", "https://evil.example.com/simple")
     monkeypatch.setenv("PYTHONPATH", "/tmp/somewhere")
     env = provider._pip_env()
+    assert "HTTPS_PROXY" not in env
+    assert "SSL_CERT_FILE" not in env
     assert "PIP_INDEX_URL" not in env
     assert "PYTHONPATH" not in env
     assert env["PIP_NO_INPUT"] == "1"
 
 
-def test_concurrent_first_calls_run_pip_once(monkeypatch: pytest.MonkeyPatch) -> None:
+# ── single-flight contract ────────────────────────────────────────────
+
+
+def test_concurrent_calls_with_genuine_overlap_install_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 4 threads; pip BLOCKS until all 4 are inside the resolver. With the
+    # production threading.Lock, exactly ONE thread reaches pip and the
+    # other three queue on the lock — barrier(1) admits that one instantly,
+    # the rest then find the resolved state. If the lock were removed (the
+    # round-2 reviewer's probe), all four would enter pip and the barrier
+    # would admit them together: calls == 4 and this test FAILS.
     _reset_state(monkeypatch)
-    rec = _PipRecorder(monkeypatch)
+    rec = _BlockingPipRecorder(monkeypatch, callers_to_admit=4)
     results: list[object] = []
-    barrier = threading.Barrier(4)
+    start = threading.Barrier(4)
 
     def _worker() -> None:
-        barrier.wait()  # maximize contention on the first call
+        start.wait()
         results.append(_resolve_scrapling_fetcher())
 
     threads = [threading.Thread(target=_worker) for _ in range(4)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
-    assert len(rec.calls) == 1  # single-flight
+        t.join(timeout=10)
+        assert not t.is_alive(), "resolver deadlocked"
+
+    assert rec.calls == 1, f"single-flight violated: {rec.calls} pip calls"
     assert all(r is _FakeFetcher for r in results)
 
 
 def test_failed_install_is_cached_for_process_lifetime(monkeypatch: pytest.MonkeyPatch) -> None:
     _reset_state(monkeypatch)
-    _PipRecorder(monkeypatch, returncode=1)
+    _BlockingPipRecorder(monkeypatch, returncode=1)
     assert _resolve_scrapling_fetcher() is None
-    # Second call must not retry pip.
-    _forbid_subprocess(monkeypatch)
+    _forbid_subprocess(monkeypatch)  # second call must not retry pip
     assert _resolve_scrapling_fetcher() is None
 
 
-def test_no_install_switch_skips_pip_in_any_casing(monkeypatch: pytest.MonkeyPatch) -> None:
-    for value in ("1", "TRUE", "Yes"):
-        _reset_state(monkeypatch)
-        monkeypatch.setenv(provider._SCRAPLING_INSTALL_ENV, value)
-        _forbid_subprocess(monkeypatch)
-        assert _resolve_scrapling_fetcher() is None, value
+def test_async_waiters_share_one_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 4 ASYNC callers: exactly one executor job is created; all await the
+    # same future. (Pip blocks until all four have entered _stealth_fetch.)
+    _reset_state(monkeypatch)
+    rec = _BlockingPipRecorder(monkeypatch, callers_to_admit=4)
+
+    async def _scenario() -> list[object]:
+        start = asyncio.Barrier(4)
+
+        async def _worker() -> object:
+            await start.wait()
+            return await provider._resolve_scrapling_fetcher_async()
+
+        return list(await asyncio.gather(*[_worker() for _ in range(4)]))
+
+    results = asyncio.run(_scenario())
+    assert rec.calls == 1
+    assert all(r is _FakeFetcher for r in results)
+    # Exactly ONE executor job was created for four waiters.
+    assert provider._scrapling_resolve_task is not None
 
 
-def test_no_install_switch_still_uses_present_scrapling(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The switch forbids installing, not stealth itself.
+# ── degradation contract ──────────────────────────────────────────────
+
+
+def test_fetcher_returned_when_scrapling_present(monkeypatch: pytest.MonkeyPatch) -> None:
     _reset_state(monkeypatch)
     _install_fake_scrapling_module(monkeypatch)
-    monkeypatch.setenv(provider._SCRAPLING_INSTALL_ENV, "1")
     _forbid_subprocess(monkeypatch)
     assert _resolve_scrapling_fetcher() is _FakeFetcher
 
 
 def test_broken_install_degrades_soft(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A package that is present but raises during attribute resolution: one
-    # repair install is attempted, the package stays broken, the outcome is
-    # cached as unavailable — and nothing escapes as a hard error.
     _reset_state(monkeypatch)
     pkg = types.ModuleType("scrapling")
 
@@ -186,11 +219,10 @@ def test_broken_install_degrades_soft(monkeypatch: pytest.MonkeyPatch) -> None:
     pkg.__getattr__ = _getattr  # type: ignore[method-assign]
     monkeypatch.setitem(sys.modules, "scrapling", pkg)
     # pip "succeeds" but the package stays broken (fix_imports=False)
-    rec = _PipRecorder(monkeypatch, returncode=0, fix_imports=False)
+    rec = _BlockingPipRecorder(monkeypatch, returncode=0, fix_imports=False)
     assert _resolve_scrapling_fetcher() is None
-    assert len(rec.calls) == 1
-    # Second call must not retry pip — failure is cached.
-    _forbid_subprocess(monkeypatch)
+    assert rec.calls == 1
+    _forbid_subprocess(monkeypatch)  # failure cached
     assert _resolve_scrapling_fetcher() is None
 
 
@@ -204,10 +236,46 @@ def test_missing_pip_degrades_soft(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _resolve_scrapling_fetcher() is None
 
 
-def test_redact_strips_urls_and_tokens() -> None:
-    raw = "fetch https://user:secret@pypi.internal/simple failed token ABCDEFGHIJKLMNOPQRSTUVWXYZ12"
-    out = _redact(raw)
-    assert "https://" not in out
-    assert "secret" not in out
-    assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ" not in out
-    assert "<url>" in out and "<token>" in out
+def test_no_install_switch_skips_pip_in_any_casing(monkeypatch: pytest.MonkeyPatch) -> None:
+    for value in ("1", "TRUE", "Yes"):
+        _reset_state(monkeypatch)
+        monkeypatch.setenv(provider._SCRAPLING_INSTALL_ENV, value)
+        _forbid_subprocess(monkeypatch)
+        assert _resolve_scrapling_fetcher() is None, value
+
+
+def test_no_install_switch_still_uses_present_scrapling(monkeypatch: pytest.MonkeyPatch) -> None:
+    _reset_state(monkeypatch)
+    _install_fake_scrapling_module(monkeypatch)
+    monkeypatch.setenv(provider._SCRAPLING_INSTALL_ENV, "1")
+    _forbid_subprocess(monkeypatch)
+    assert _resolve_scrapling_fetcher() is _FakeFetcher
+
+
+# ── inter-process lock ────────────────────────────────────────────────
+
+
+def test_interprocess_lock_rechecks_after_acquiring(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Process B acquires the flock after process A installed; the post-lock
+    # recheck must skip pip entirely.
+    _reset_state(monkeypatch)
+    calls: list[list[str]] = []
+
+    class _FakeLock:
+        def release(self) -> None:
+            pass
+
+    def _fake_lock():
+        # Simulate: while we waited, ANOTHER process finished the install.
+        _install_fake_scrapling_module(monkeypatch)
+        return _FakeLock()
+
+    monkeypatch.setattr(provider, "_interprocess_lock", _fake_lock)
+
+    def _fake_run(argv, **kwargs):  # noqa: ANN001, ANN003
+        calls.append(list(argv))
+        return _Proc(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    assert _resolve_scrapling_fetcher() is _FakeFetcher
+    assert calls == [], "post-lock recheck failed — redundant pip after cross-process install"

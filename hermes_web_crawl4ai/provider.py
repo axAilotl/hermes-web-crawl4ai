@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -173,12 +174,19 @@ async def _extract_pdf(url: str) -> dict[str, Any]:
 _SCRAPLING_SPEC = "scrapling[fetchers]==0.4.14"
 _SCRAPLING_INSTALL_ENV = "HERMES_WEB_CRAWL4AI_NO_INSTALL"
 _SCRAPLING_INSTALL_TIMEOUT_SECONDS = 600
+# Waiters give up slightly after the pip deadline so the install outcome is
+# normally known; the background install itself is never aborted by a waiter.
+_SCRAPLING_RESOLVE_DEADLINE_SECONDS = 620
 
-# Single-flight resolution: the first caller installs; everyone else waits on
-# the lock and reuses the outcome. Failed installs are cached for the process
-# lifetime (retrying pip on every challenge would hammer a broken index).
+# Single-flight resolution: the first caller installs; everyone else reuses
+# the outcome. Failed installs are cached for the process lifetime (retrying
+# pip on every challenge would hammer a broken index).
 _scrapling_lock = threading.Lock()
 _scrapling_state: dict[str, Any] = {"resolved": False, "fetcher": None}
+# One shared in-flight resolution per event loop; waiters await the SAME
+# future instead of each blocking an executor thread on the lock.
+_scrapling_resolve_task: Any = None
+_scrapling_async_guard = asyncio.Lock()
 
 
 def _no_install_requested() -> bool:
@@ -186,35 +194,24 @@ def _no_install_requested() -> bool:
     return value not in ("", "0", "false", "no")
 
 
-def _pip_env() -> dict[str, str]:
-    """Environment for the pip child: ambient vars minus pip/python overrides.
+# Deliberate allowlist: the pip child sees ONLY these ambient variables plus
+# the two PIP_* knobs set below. Proxy and TLS-override variables
+# (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/SSL_CERT_FILE/REQUESTS_CA_BUNDLE/…) are
+# deliberately excluded — an injected proxy or CA bundle could redirect or
+# MITM the pinned install, and pip's --isolated does not disable proxy
+# handling (verified empirically against pip 26.x). Hosts that genuinely
+# need a corporate proxy should install eagerly: pip install -e ".[stealth]".
+_PIP_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TMP")
 
-    ``PIP_*`` variables can redirect the index, target dir, or trusted hosts;
-    ``PYTHONPATH``/``PYTHONHOME`` can change what the child interpreter
-    imports. Strip all three (pip also runs with ``--isolated`` so its own
-    config files are ignored) while keeping PATH/HOME/locale for TLS and
-    filesystem sanity.
-    """
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.upper().startswith("PIP_")
-        and key.upper() not in ("PYTHONPATH", "PYTHONHOME")
-    }
+
+def _pip_env() -> dict[str, str]:
+    env = {key: os.environ[key] for key in _PIP_ENV_ALLOWLIST if key in os.environ}
     env["PIP_NO_INPUT"] = "1"
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     return env
 
 
-def _redact(text: str) -> str:
-    """Best-effort sanitizer for pip diagnostics: strip URLs and token-shaped
-    runs before logging a bounded tail."""
-    text = re.sub(r"https?://\S+", "<url>", text)
-    text = re.sub(r"[A-Za-z0-9_+=.-]{24,}", "<token>", text)
-    return text[-300:]
-
-
-def _try_import_scrapling() -> Optional[Any]:
+def _try_import_scrapling() -> Any:
     """Return StealthyFetcher, or None when missing OR broken.
 
     A partially broken install can raise things other than ImportError while
@@ -229,6 +226,41 @@ def _try_import_scrapling() -> Optional[Any]:
         return None
 
 
+def _interprocess_lock():
+    """Acquire a best-effort inter-process lock around the pip run.
+
+    Returns an object with a ``release()`` method, or None when locking is
+    unavailable (non-fcntl platforms, unwritable temp dir). Hardened: the
+    lock file is created with ``O_NOFOLLOW|O_CREAT`` and private perms so a
+    pre-planted symlink/FIFO in a world-writable tmp cannot redirect or
+    stall us, and a failed flock never leaks the open handle.
+    """
+    try:
+        import fcntl
+        import tempfile
+
+        lock_path = os.path.join(
+            tempfile.gettempdir(), f"hermes-web-crawl4ai-scrapling-{os.getuid()}.lock"
+        )
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except Exception:  # noqa: BLE001
+            os.close(fd)
+            return None
+
+        class _Released:
+            def release(self) -> None:
+                with contextlib.suppress(Exception):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                with contextlib.suppress(Exception):
+                    os.close(fd)
+
+        return _Released()
+    except Exception:  # noqa: BLE001 — locking is best-effort
+        return None
+
+
 def _pip_install_scrapling() -> bool:
     """Run the one-time pinned install. Returns True on pip success."""
     import subprocess
@@ -236,6 +268,7 @@ def _pip_install_scrapling() -> bool:
 
     argv = [
         sys.executable,
+        "-I",
         "-m",
         "pip",
         "install",
@@ -245,21 +278,12 @@ def _pip_install_scrapling() -> bool:
         _SCRAPLING_SPEC,
     ]
     logger.info("Installing %s for stealth escalation (one-time)…", _SCRAPLING_SPEC)
-    lock_file = None
+    lock = _interprocess_lock()
     try:
-        # Best-effort inter-process lock so two gateway processes can't race
-        # pip against the same environment. Platforms without fcntl (or a
-        # unwritable temp dir) degrade to the in-process lock alone.
-        import fcntl
-        import tempfile
-
-        lock_path = os.path.join(tempfile.gettempdir(), "hermes-web-crawl4ai-scrapling.lock")
-        lock_file = open(lock_path, "a")  # noqa: SIM115 — held for the install
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-    except Exception:  # noqa: BLE001 — locking is best-effort
-        lock_file = None
-
-    try:
+        if _try_import_scrapling() is not None:
+            # Another process completed the install while we waited on the
+            # inter-process lock — skip the redundant pip run.
+            return True
         proc = subprocess.run(
             argv,
             capture_output=True,
@@ -271,27 +295,21 @@ def _pip_install_scrapling() -> bool:
     except FileNotFoundError:
         logger.warning("scrapling self-install failed: pip is not available in this environment")
         return False
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "scrapling self-install timed out after %ss", _SCRAPLING_INSTALL_TIMEOUT_SECONDS
+        )
+        return False
     except Exception as exc:  # noqa: BLE001 — any failure just disables the leg
         logger.warning("scrapling self-install failed: %s", exc)
         return False
     finally:
-        if lock_file is not None:
-            try:
-                import fcntl as _fcntl
-
-                _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_UN)
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                lock_file.close()
-            except Exception:  # noqa: BLE001
-                pass
+        if lock is not None:
+            lock.release()
     if proc.returncode != 0:
-        logger.warning(
-            "scrapling self-install failed (rc=%d): %s",
-            proc.returncode,
-            _redact(proc.stderr or ""),
-        )
+        # Fixed classification only — pip stderr can embed index URLs and
+        # credentials (even via a proxied connection) and is never logged.
+        logger.warning("scrapling self-install failed (pip exit %d)", proc.returncode)
         return False
     return True
 
@@ -317,30 +335,64 @@ def _resolve_scrapling_fetcher():
             return _scrapling_state["fetcher"]
 
         fetcher = _try_import_scrapling()
-        if fetcher is None and not _no_install_requested():
-            if _pip_install_scrapling():
-                import importlib
+        if fetcher is None and not _no_install_requested() and _pip_install_scrapling():
+            import importlib
 
-                importlib.invalidate_caches()
-                fetcher = _try_import_scrapling()
-                if fetcher is None:
-                    logger.warning("scrapling still unimportable after a successful self-install")
+            importlib.invalidate_caches()
+            fetcher = _try_import_scrapling()
+            if fetcher is None:
+                logger.warning("scrapling still unimportable after a successful self-install")
 
         _scrapling_state["resolved"] = True
         _scrapling_state["fetcher"] = fetcher
         return fetcher
 
 
-async def _stealth_fetch(url: str) -> Optional[dict[str, Any]]:
+async def _resolve_scrapling_fetcher_async():
+    """Awaitable single-flight resolution for the event-loop world.
+
+    The FIRST caller runs the (possibly minutes-long) resolution in one
+    worker thread; concurrent callers await the SAME future — no per-waiter
+    executor threads parked on the lock. Waiters impose a deadline slightly
+    above the pip timeout: if resolution somehow exceeds it, waiters get
+    None (stealth unavailable this call) while the background resolution
+    finishes and caches for later calls.
+    """
+    global _scrapling_resolve_task
+    loop = asyncio.get_running_loop()
+    async with _scrapling_async_guard:
+        if _scrapling_state["resolved"]:
+            return _scrapling_state["fetcher"]
+        if _scrapling_resolve_task is None or _scrapling_resolve_task.done():
+            _scrapling_resolve_task = loop.run_in_executor(None, _resolve_scrapling_fetcher)
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(_scrapling_resolve_task),
+            timeout=_SCRAPLING_RESOLVE_DEADLINE_SECONDS,
+        )
+    except TimeoutError:
+        logger.warning(
+            "scrapling resolution exceeded %ss — stealth deferred this call",
+            _SCRAPLING_RESOLVE_DEADLINE_SECONDS,
+        )
+        return None
+    except Exception:  # noqa: BLE001 — resolution never breaks the caller
+        return None
+
+
+async def _stealth_fetch(url: str) -> dict[str, Any] | None:
     """Last-resort stealth fetch via scrapling when the content gate flags a
-    challenge/block. Runs in-process (not Docker), so it also covers a downed
-    Crawl4AI container. scrapling's StealthyFetcher is synchronous, so it runs
-    in a worker thread. Returns None on any failure.
+    challenge/block on an otherwise-successful Crawl4AI response. scrapling's
+    StealthyFetcher is synchronous, so it runs in a worker thread. Returns
+    None on any failure.
+
+    Scope note: this does NOT run when Crawl4AI itself errors out (container
+    down, connection refused, HTTP 5xx) — only when a fetched document is
+    classified as a challenge/block by the content gate.
 
     Browser engines are provisioned separately — after the first install, run
     ``scrapling install`` once (see scrapling's docs) — see README."""
-    # Resolver may run pip (minutes on a cold host): keep it off the event loop.
-    fetcher_cls = await asyncio.to_thread(_resolve_scrapling_fetcher)
+    fetcher_cls = await _resolve_scrapling_fetcher_async()
     if fetcher_cls is None:
         return None
 

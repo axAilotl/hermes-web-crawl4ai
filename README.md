@@ -11,12 +11,18 @@ plugin registry while compatibility testing is underway.
 ### Stealth escalation (optional)
 
 When the content-quality gate flags a challenge/block (e.g. a Cloudflare
-wall) or the Crawl4AI container is down, the plugin falls back to an
-in-process stealth fetch via [scrapling]. The pinned dependency
+wall) on an otherwise-successful Crawl4AI response, the plugin falls
+back to an in-process stealth fetch via [scrapling]. (Note: if the
+Crawl4AI container itself is down, that connection error is returned as
+a typed error — the stealth leg only engages on fetched-but-blocked
+documents.) The pinned dependency
 `scrapling[fetchers]==0.4.14` self-installs on first use (set
 `HERMES_WEB_CRAWL4AI_NO_INSTALL=1` to forbid runtime installs — note this
 only disables *installing*: if scrapling is already importable, stealth
-still runs), or install eagerly with:
+still runs). The self-install deliberately runs pip in a sanitized,
+proxy-free environment (no `HTTPS_PROXY`/`SSL_CERT_FILE`/etc. — an
+injected proxy could otherwise redirect the install). Hosts behind a
+corporate proxy should install eagerly instead:
 
     pip install -e ".[stealth]"
 
