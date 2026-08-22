@@ -115,10 +115,16 @@ def test_pip_argv_and_kwargs_are_pinned(monkeypatch: pytest.MonkeyPatch) -> None
     assert kwargs["timeout"] == provider._SCRAPLING_INSTALL_TIMEOUT_SECONDS
     assert kwargs["stdin"] == subprocess.DEVNULL
     # Allowlisted child environment — no proxies, no TLS overrides, no
-    # PIP_*/PYTHON* ambient state beyond the two deliberate knobs.
+    # PIP_*/PYTHON* ambient state beyond the two deliberate knobs. The
+    # platform-aware allowlist applies (POSIX subset on this host).
     child_env = kwargs["env"]
+    expected_allow = (
+        provider._PIP_ENV_ALLOWLIST_WINDOWS
+        if sys.platform == "win32"
+        else provider._PIP_ENV_ALLOWLIST_POSIX
+    )
     assert set(child_env) - {"PIP_NO_INPUT", "PIP_DISABLE_PIP_VERSION_CHECK"} <= set(
-        provider._PIP_ENV_ALLOWLIST
+        expected_allow
     )
     assert child_env["PIP_NO_INPUT"] == "1"
     assert not any(k.upper().startswith("HTTPS_PROXY") for k in child_env)
@@ -143,20 +149,24 @@ def test_pip_env_is_a_pure_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_concurrent_calls_with_genuine_overlap_install_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # 4 threads; pip BLOCKS until all 4 are inside the resolver. With the
-    # production threading.Lock, exactly ONE thread reaches pip and the
-    # other three queue on the lock — barrier(1) admits that one instantly,
-    # the rest then find the resolved state. If the lock were removed (the
-    # round-2 reviewer's probe), all four would enter pip and the barrier
-    # would admit them together: calls == 4 and this test FAILS.
+    # 4 threads; pip BLOCKS until 4 callers are inside the resolver. The
+    # inter-process lock is disabled for this test so ONLY the in-process
+    # threading.Lock provides single-flight (removing THAT lock then yields
+    # 4 pip calls and fails the test — verified by reviewer probes and by
+    # construction).
     _reset_state(monkeypatch)
+    monkeypatch.setattr(provider, "_interprocess_lock", lambda: None)
     rec = _BlockingPipRecorder(monkeypatch, callers_to_admit=4)
     results: list[object] = []
+    errors: list[BaseException] = []
     start = threading.Barrier(4)
 
     def _worker() -> None:
-        start.wait()
-        results.append(_resolve_scrapling_fetcher())
+        try:
+            start.wait()
+            results.append(_resolve_scrapling_fetcher())
+        except BaseException as exc:  # noqa: BLE001 — record, don't swallow
+            errors.append(exc)
 
     threads = [threading.Thread(target=_worker) for _ in range(4)]
     for t in threads:
@@ -165,6 +175,8 @@ def test_concurrent_calls_with_genuine_overlap_install_once(
         t.join(timeout=10)
         assert not t.is_alive(), "resolver deadlocked"
 
+    assert not errors, f"worker exceptions: {errors!r}"
+    assert len(results) == 4
     assert rec.calls == 1, f"single-flight violated: {rec.calls} pip calls"
     assert all(r is _FakeFetcher for r in results)
 
@@ -179,12 +191,23 @@ def test_failed_install_is_cached_for_process_lifetime(monkeypatch: pytest.Monke
 
 def test_async_waiters_share_one_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     # 4 ASYNC callers: exactly one executor job is created; all await the
-    # same future. (Pip blocks until all four have entered _stealth_fetch.)
+    # same future. Executor submissions are counted explicitly — multiple
+    # jobs serialized by locks would still pass a pip-call count alone.
     _reset_state(monkeypatch)
+    monkeypatch.setattr(provider, "_interprocess_lock", lambda: None)
     rec = _BlockingPipRecorder(monkeypatch, callers_to_admit=4)
+    submissions: list[object] = []
 
     async def _scenario() -> list[object]:
         start = asyncio.Barrier(4)
+        loop = asyncio.get_running_loop()
+        real_run_in_executor = loop.run_in_executor
+
+        def _counting_run_in_executor(executor, func, *args):  # noqa: ANN001, ANN003
+            submissions.append(func)
+            return real_run_in_executor(executor, func, *args)
+
+        loop.run_in_executor = _counting_run_in_executor  # type: ignore[method-assign]
 
         async def _worker() -> object:
             await start.wait()
@@ -194,8 +217,8 @@ def test_async_waiters_share_one_resolution(monkeypatch: pytest.MonkeyPatch) -> 
 
     results = asyncio.run(_scenario())
     assert rec.calls == 1
+    assert len(submissions) == 1, f"expected 1 executor job, got {len(submissions)}"
     assert all(r is _FakeFetcher for r in results)
-    # Exactly ONE executor job was created for four waiters.
     assert provider._scrapling_resolve_task is not None
 
 

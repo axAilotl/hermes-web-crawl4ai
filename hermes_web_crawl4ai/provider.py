@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 from functools import lru_cache
 from typing import Any, Optional
@@ -201,11 +202,28 @@ def _no_install_requested() -> bool:
 # MITM the pinned install, and pip's --isolated does not disable proxy
 # handling (verified empirically against pip 26.x). Hosts that genuinely
 # need a corporate proxy should install eagerly: pip install -e ".[stealth]".
-_PIP_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TMP")
+# Windows requires its system variables (Python documents subprocess failure
+# without SystemRoot), so the allowlist is platform-aware.
+_PIP_ENV_ALLOWLIST_POSIX = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TMP")
+_PIP_ENV_ALLOWLIST_WINDOWS = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "COMSPEC",
+    "WINDIR",
+    "USERPROFILE",
+)
 
 
 def _pip_env() -> dict[str, str]:
-    env = {key: os.environ[key] for key in _PIP_ENV_ALLOWLIST if key in os.environ}
+    allow = _PIP_ENV_ALLOWLIST_WINDOWS if sys.platform == "win32" else _PIP_ENV_ALLOWLIST_POSIX
+    env = {key: os.environ[key] for key in allow if key in os.environ}
     env["PIP_NO_INPUT"] = "1"
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     return env
@@ -239,10 +257,15 @@ def _interprocess_lock():
         import fcntl
         import tempfile
 
+        if not hasattr(os, "O_NOFOLLOW"):
+            # Without O_NOFOLLOW a pre-planted symlink in a shared tmp would
+            # be silently followed — degrade to the in-process lock instead.
+            return None
+
         lock_path = os.path.join(
             tempfile.gettempdir(), f"hermes-web-crawl4ai-scrapling-{os.getuid()}.lock"
         )
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
         except Exception:  # noqa: BLE001
@@ -364,7 +387,19 @@ async def _resolve_scrapling_fetcher_async():
         if _scrapling_state["resolved"]:
             return _scrapling_state["fetcher"]
         if _scrapling_resolve_task is None or _scrapling_resolve_task.done():
-            _scrapling_resolve_task = loop.run_in_executor(None, _resolve_scrapling_fetcher)
+            def _resolve_and_pin() -> Any:
+                try:
+                    return _resolve_scrapling_fetcher()
+                except Exception:  # noqa: BLE001 — never let an unexpected
+                    # executor failure leave the state non-terminal: the sync
+                    # resolver only fails to pin state via a bug, and a
+                    # non-terminal state would re-submit resolutions forever.
+                    with _scrapling_lock:
+                        _scrapling_state["resolved"] = True
+                        _scrapling_state["fetcher"] = None
+                    return None
+
+            _scrapling_resolve_task = loop.run_in_executor(None, _resolve_and_pin)
     try:
         return await asyncio.wait_for(
             asyncio.shield(_scrapling_resolve_task),
