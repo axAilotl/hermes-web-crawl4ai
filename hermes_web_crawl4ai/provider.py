@@ -399,7 +399,15 @@ async def _resolve_scrapling_fetcher_async():
                         _scrapling_state["fetcher"] = None
                     return None
 
-            _scrapling_resolve_task = loop.run_in_executor(None, _resolve_and_pin)
+            try:
+                _scrapling_resolve_task = loop.run_in_executor(None, _resolve_and_pin)
+            except Exception:  # noqa: BLE001 — executor submission itself failed
+                # (rare: loop shutting down / executor broken). Pin terminal
+                # state so later calls don't re-submit forever.
+                with _scrapling_lock:
+                    _scrapling_state["resolved"] = True
+                    _scrapling_state["fetcher"] = None
+                return None
     try:
         return await asyncio.wait_for(
             asyncio.shield(_scrapling_resolve_task),
