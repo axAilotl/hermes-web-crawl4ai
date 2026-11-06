@@ -10,7 +10,6 @@ from hermes_web_crawl4ai.provider import (
     Crawl4AIWebSearchProvider,
     _normalize_document,
     _normalize_documents,
-    crawl4ai_crawl_tool,
 )
 
 
@@ -50,8 +49,7 @@ def test_normalize_documents_accepts_known_list_envelopes(key: str) -> None:
 
 
 def test_provider_is_extract_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(provider_module, "_api_url", lambda: "http://localhost:11235")
-    provider = Crawl4AIWebSearchProvider()
+    provider = Crawl4AIWebSearchProvider({"api_url": "http://localhost:11235"}.get)
 
     assert provider.name == "crawl4ai"
     assert provider.supports_search() is False
@@ -59,16 +57,15 @@ def test_provider_is_extract_only(monkeypatch: pytest.MonkeyPatch) -> None:
     assert provider.is_available() is True
 
 
-def test_api_url_reads_non_secret_setting_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        provider_module,
-        "_plugin_config",
-        lambda: {"api_url": "http://configured.example:11235/"},
-    )
-    assert provider_module._api_url() == "http://configured.example:11235"
-
-    monkeypatch.setattr(provider_module, "_plugin_config", lambda: {})
-    assert provider_module._api_url() == ""
+def test_settings_are_read_dynamically_and_instances_are_independent(monkeypatch):
+    monkeypatch.setattr(provider_module, "get_provider_env", lambda key: "")
+    settings = {"api_url": "http://first.example:11235/"}
+    first = Crawl4AIWebSearchProvider(settings.get)
+    second = Crawl4AIWebSearchProvider({"api_url": "http://second.example:11235"}.get)
+    assert first._api_url() == "http://first.example:11235"
+    settings["api_url"] = "http://changed.example:11235"
+    assert first._api_url() == "http://changed.example:11235"
+    assert second._api_url() == "http://second.example:11235"
 
 
 def test_normalize_document_prefers_redirect_destination_for_policy_checks() -> None:
@@ -91,7 +88,7 @@ async def test_extract_preserves_order_and_returns_per_url_errors(
     provider = Crawl4AIWebSearchProvider()
     monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        provider_module,
+        provider,
         "_fetch_document",
         AsyncMock(
             side_effect=[
@@ -139,10 +136,11 @@ async def test_crawl_tool_rejects_unsafe_seed(monkeypatch: pytest.MonkeyPatch) -
         "_target_error",
         AsyncMock(return_value="Blocked: URL targets a private or internal network address"),
     )
+    provider = Crawl4AIWebSearchProvider()
     post = AsyncMock()
-    monkeypatch.setattr(provider_module, "_post_json", post)
+    monkeypatch.setattr(provider, "_post_json", post)
 
-    result = json.loads(await crawl4ai_crawl_tool({"url": "http://127.0.0.1"}))
+    result = json.loads(await provider.crawl4ai_crawl_tool({"url": "http://127.0.0.1"}))
 
     assert result["success"] is False
     assert "private or internal" in result["error"]
@@ -154,6 +152,7 @@ async def test_crawl_tool_clamps_depth_pages_and_filters_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    provider = Crawl4AIWebSearchProvider()
     post = AsyncMock(
         return_value={
             "results": [
@@ -167,10 +166,10 @@ async def test_crawl_tool_clamps_depth_pages_and_filters_results(
             ]
         }
     )
-    monkeypatch.setattr(provider_module, "_post_json", post)
+    monkeypatch.setattr(provider, "_post_json", post)
 
     result = json.loads(
-        await crawl4ai_crawl_tool(
+        await provider.crawl4ai_crawl_tool(
             {"url": "https://example.com/docs", "depth": "advanced", "max_pages": 999}
         )
     )
@@ -193,8 +192,9 @@ async def test_crawl_tool_clamps_depth_pages_and_filters_results(
 @pytest.mark.asyncio
 async def test_crawl_tool_rejects_cross_site_results(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    provider = Crawl4AIWebSearchProvider()
     monkeypatch.setattr(
-        provider_module,
+        provider,
         "_post_json",
         AsyncMock(
             return_value={
@@ -209,7 +209,7 @@ async def test_crawl_tool_rejects_cross_site_results(monkeypatch: pytest.MonkeyP
         ),
     )
 
-    result = json.loads(await crawl4ai_crawl_tool({"url": "https://example.com"}))
+    result = json.loads(await provider.crawl4ai_crawl_tool({"url": "https://example.com"}))
 
     assert result["results"][0]["content"] == ""
     assert "left the seed site" in result["results"][0]["error"]

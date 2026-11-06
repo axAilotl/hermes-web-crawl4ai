@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 
-def test_real_hermes_directory_discovery(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("settings_key", ["settings", "config"])
+def test_real_hermes_directory_discovery(tmp_path, monkeypatch, settings_key) -> None:
     """Exercise the real manifest scan, namespaced import, and registrations."""
     from agent import web_search_registry
     from hermes_cli.plugins import PluginManager
@@ -22,9 +24,7 @@ def test_real_hermes_directory_discovery(tmp_path, monkeypatch) -> None:
                 "plugins": {
                     "enabled": ["hermes-web-crawl4ai"],
                     "entries": {
-                        "hermes-web-crawl4ai": {
-                            "config": {"api_url": "http://localhost:11235"}
-                        }
+                        "hermes-web-crawl4ai": {settings_key: {"api_url": "http://localhost:11235"}}
                     },
                 },
                 "web": {"extract_backend": "crawl4ai"},
@@ -34,18 +34,18 @@ def test_real_hermes_directory_discovery(tmp_path, monkeypatch) -> None:
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    providers_before = dict(web_search_registry._providers)
+    manager = PluginManager()
     try:
-        manager = PluginManager()
         manager.discover_and_load()
 
         loaded = manager._plugins["hermes-web-crawl4ai"]
         assert loaded.enabled is True
         assert loaded.error is None
         assert loaded.tools_registered == ["crawl4ai_crawl"]
-        assert web_search_registry.get_provider("crawl4ai") is not None
+        provider = web_search_registry.get_provider("crawl4ai")
+        assert provider.is_available()
+        assert provider._api_url() == "http://localhost:11235"
+        assert web_search_registry.get_active_extract_provider() is provider
         assert registry.get_entry("crawl4ai_crawl") is not None
     finally:
-        registry.deregister("crawl4ai_crawl")
-        web_search_registry._providers.clear()
-        web_search_registry._providers.update(providers_before)
+        manager.unload()

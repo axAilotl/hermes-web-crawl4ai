@@ -8,6 +8,9 @@ class FakeContext:
         self.providers = []
         self.tools = []
 
+    def get_config(self, key, default=None):
+        return default
+
     def register_web_search_provider(self, provider) -> None:
         self.providers.append(provider)
 

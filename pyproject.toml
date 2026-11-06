@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-web-crawl4ai"
-version = "0.1.0"
+version = "0.2.0"
 description = "Standalone Crawl4AI web extraction and bounded crawling plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,6 +17,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.14",
 ]
 
 [project.entry-points."hermes_agent.plugins"]
@@ -27,13 +28,14 @@ Repository = "https://github.com/axAilotl/hermes-web-crawl4ai"
 Issues = "https://github.com/axAilotl/hermes-web-crawl4ai/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "pytest-asyncio>=0.23,<2", "ruff>=0.9,<1"]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.23,<2", "ruff>=0.9,<1", "PyYAML>=6,<7"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["hermes_web_crawl4ai"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.ruff]

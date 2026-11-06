@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
 
@@ -21,35 +20,6 @@ DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_CONCURRENCY = 4
 DEFAULT_MAX_CHARS = 20_000
 MAX_CRAWL_PAGES = 20
-
-
-@lru_cache(maxsize=1)
-def _plugin_config() -> dict[str, Any]:
-    """Read this plugin's non-secret settings from config.yaml."""
-    try:
-        from hermes_cli.config import load_config
-
-        config = load_config() or {}
-    except Exception:  # noqa: BLE001 - stripped/early host contexts fail closed
-        return {}
-    entries = (config.get("plugins") or {}).get("entries") or {}
-    entry = entries.get(PLUGIN_ID) or {}
-    settings = entry.get("config") or {}
-    return settings if isinstance(settings, dict) else {}
-
-
-def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
-    value = _plugin_config().get(name, default)
-    try:
-        return max(minimum, min(int(value), maximum))
-    except (TypeError, ValueError):
-        return default
-
-
-def _api_url() -> str:
-    """Return the Crawl4AI base URL from the plugin's config.yaml block."""
-    configured = str(_plugin_config().get("api_url") or "").strip()
-    return configured.rstrip("/")
 
 
 def _headers() -> dict[str, str]:
@@ -177,29 +147,6 @@ def _normalize_documents(response: Any, fallback_url: str = "") -> list[dict[str
     return documents
 
 
-async def _post_json(path: str, payload: dict[str, Any], *, timeout: int) -> dict[str, Any]:
-    api_url = _api_url()
-    if not api_url:
-        raise ValueError(
-            "Crawl4AI is not configured. Set "
-            f"plugins.entries.{PLUGIN_ID}.config.api_url in config.yaml."
-        )
-    parsed_url = urlparse(api_url)
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
-        raise ValueError("Crawl4AI api_url must be an HTTP(S) URL with a hostname")
-    if parsed_url.username or parsed_url.password:
-        raise ValueError(
-            "Crawl4AI api_url must not contain credentials; use CRAWL4AI_API_TOKEN"
-        )
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        response = await client.post(f"{api_url}{path}", json=payload, headers=_headers())
-        response.raise_for_status()
-        parsed = response.json()
-    if not isinstance(parsed, dict):
-        raise ValueError("Crawl4AI returned a non-object JSON response")
-    return parsed
-
-
 async def _target_error(url: str) -> str | None:
     """Return a policy error for a model/backend-provided target URL."""
     if not await async_is_safe_url(url):
@@ -214,27 +161,6 @@ def _error_document(url: str, error: str) -> dict[str, Any]:
     return {"url": url, "title": "", "content": "", "raw_content": "", "error": error}
 
 
-def _truncate_document(document: dict[str, Any]) -> dict[str, Any]:
-    limit = _bounded_int("max_chars_per_page", DEFAULT_MAX_CHARS, 2_000, 200_000)
-    result = dict(document)
-    content = str(result.get("content") or "")
-    if len(content) > limit:
-        result["content"] = content[:limit] + f"\n\n[Truncated after {limit} characters]"
-    raw = str(result.get("raw_content") or "")
-    if len(raw) > limit:
-        result["raw_content"] = raw[:limit]
-    return result
-
-
-async def _secure_document(document: dict[str, Any], fallback_url: str) -> dict[str, Any]:
-    url = str(document.get("url") or fallback_url)
-    error = await _target_error(url)
-    if error:
-        return _error_document(url, error)
-    document["url"] = url
-    return _truncate_document(document)
-
-
 def _is_same_site(seed_url: str, candidate_url: str) -> bool:
     """Accept the seed host and its subdomains; reject unrelated crawl results."""
     seed_host = (urlparse(seed_url).hostname or "").lower().rstrip(".")
@@ -244,25 +170,12 @@ def _is_same_site(seed_url: str, candidate_url: str) -> bool:
     return candidate_host == seed_host or candidate_host.endswith(f".{seed_host}")
 
 
-async def _fetch_document(url: str, *, format: str | None = None) -> dict[str, Any]:
-    """Fetch one URL through Crawl4AI's flat rendered-content endpoints."""
-    timeout = _bounded_int("timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 10, 300)
-    if format == "html":
-        raw = await _post_json("/html", {"url": url}, timeout=timeout)
-        document = _normalize_document(raw, fallback_url=url)
-    else:
-        raw = await _post_json("/md", {"url": url, "f": "fit"}, timeout=timeout)
-        document = _normalize_document(raw, fallback_url=url)
-        if not document.get("content") and not document.get("error"):
-            raw = await _post_json("/md", {"url": url, "f": "raw"}, timeout=timeout)
-            document = _normalize_document(raw, fallback_url=url)
-    if not document:
-        return _error_document(url, "Crawl4AI returned no document")
-    return await _secure_document(document, url)
-
-
 class Crawl4AIWebSearchProvider(WebSearchProvider):
-    """Extract-only provider intended to pair with Hermes' bundled SearXNG plugin."""
+    """Extract-only provider intended to pair with any search-only provider."""
+
+    def __init__(self, get_config=None):
+        # The context resolves settings for the active Hermes profile on every call.
+        self.get_config = get_config or (lambda key, default=None: default)
 
     @property
     def name(self) -> str:
@@ -273,7 +186,15 @@ class Crawl4AIWebSearchProvider(WebSearchProvider):
         return "Crawl4AI"
 
     def is_available(self) -> bool:
-        return bool(_api_url())
+        try:
+            parsed = urlparse(self._api_url())
+            return bool(
+                parsed.scheme in {"http", "https"}
+                and parsed.hostname
+                and not (parsed.username or parsed.password or parsed.query or parsed.fragment)
+            )
+        except ValueError:
+            return False
 
     def supports_search(self) -> bool:
         return False
@@ -283,7 +204,7 @@ class Crawl4AIWebSearchProvider(WebSearchProvider):
 
     async def extract(self, urls: list[str], **kwargs: Any) -> list[dict[str, Any]]:
         format_value = kwargs.get("format")
-        concurrency = _bounded_int("concurrency", DEFAULT_CONCURRENCY, 1, 10)
+        concurrency = self._bounded_int("concurrency", DEFAULT_CONCURRENCY, 1, 10)
         semaphore = asyncio.Semaphore(concurrency)
 
         async def extract_one(url: str) -> dict[str, Any]:
@@ -293,7 +214,7 @@ class Crawl4AIWebSearchProvider(WebSearchProvider):
                 if error:
                     return _error_document(normalized_url, error)
                 async with semaphore:
-                    return await _fetch_document(normalized_url, format=format_value)
+                    return await self._fetch_document(normalized_url, format=format_value)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - one failed URL must not fail the batch
@@ -307,68 +228,141 @@ class Crawl4AIWebSearchProvider(WebSearchProvider):
         return {
             "name": "Crawl4AI",
             "badge": "free · self-hosted",
-            "tag": "Extract backend; pair with bundled SearXNG for a local OSS stack.",
+            "tag": "Extract backend; pair with SearXNG for a local OSS stack.",
             "env_vars": [],
         }
 
+    def _bounded_int(self, name: str, default: int, minimum: int, maximum: int) -> int:
+        value = self.get_config(name, default)
+        try:
+            return max(minimum, min(int(value), maximum))
+        except (TypeError, ValueError, OverflowError):
+            return default
 
-async def crawl4ai_crawl_tool(args: dict[str, Any], **_: Any) -> str:
-    """Run a bounded deep crawl without adding a core Hermes tool."""
-    try:
-        url = normalize_url_for_request(str(args.get("url") or "").strip())
-        if not url:
-            return json.dumps({"success": False, "error": "A URL is required"})
+    def _api_url(self) -> str:
+        """Return the Crawl4AI base URL from the plugin's config.yaml block."""
+        configured = str(self.get_config("api_url") or get_provider_env("CRAWL4AI_URL")).strip()
+        return configured.rstrip("/")
+
+    async def _post_json(
+        self, path: str, payload: dict[str, Any], *, timeout: int
+    ) -> dict[str, Any]:
+        api_url = self._api_url()
+        if not api_url:
+            raise ValueError(
+                "Crawl4AI is not configured. Set "
+                f"plugins.entries.{PLUGIN_ID}.settings.api_url in config.yaml."
+            )
+        parsed_url = urlparse(api_url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+            raise ValueError("Crawl4AI api_url must be an HTTP(S) URL with a hostname")
+        if parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment:
+            raise ValueError(
+                "Crawl4AI api_url must not contain credentials, a query, or a fragment; "
+                "use CRAWL4AI_API_TOKEN"
+            )
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            response = await client.post(f"{api_url}{path}", json=payload, headers=_headers())
+            response.raise_for_status()
+            parsed = response.json()
+        if not isinstance(parsed, dict):
+            raise ValueError("Crawl4AI returned a non-object JSON response")
+        if parsed.get("success") is False:
+            raise ValueError("Crawl4AI reported a failed request")
+        return parsed
+
+    def _truncate_document(self, document: dict[str, Any]) -> dict[str, Any]:
+        limit = self._bounded_int("max_chars_per_page", DEFAULT_MAX_CHARS, 2_000, 200_000)
+        result = dict(document)
+        content = str(result.get("content") or "")
+        if len(content) > limit:
+            result["content"] = content[:limit] + f"\n\n[Truncated after {limit} characters]"
+        raw = str(result.get("raw_content") or "")
+        if len(raw) > limit:
+            result["raw_content"] = raw[:limit]
+        return result
+
+    async def _secure_document(self, document: dict[str, Any], fallback_url: str) -> dict[str, Any]:
+        url = str(document.get("url") or fallback_url)
         error = await _target_error(url)
         if error:
-            return json.dumps({"success": False, "error": error, "url": url})
+            return _error_document(url, error)
+        document["url"] = url
+        return self._truncate_document(document)
 
-        depth = "advanced" if args.get("depth") == "advanced" else "basic"
-        max_pages = max(1, min(int(args.get("max_pages", 10)), MAX_CRAWL_PAGES))
-        max_depth = 2 if depth == "advanced" else 1
-        timeout = _bounded_int("crawl_timeout_seconds", 180, 30, 300)
+    async def _fetch_document(self, url: str, *, format: str | None = None) -> dict[str, Any]:
+        """Fetch one URL through Crawl4AI's flat rendered-content endpoints."""
+        timeout = self._bounded_int("timeout_seconds", DEFAULT_TIMEOUT_SECONDS, 10, 300)
+        if format == "html":
+            raw = await self._post_json("/html", {"url": url}, timeout=timeout)
+            document = _normalize_document(raw, fallback_url=url)
+        else:
+            raw = await self._post_json("/md", {"url": url, "f": "fit"}, timeout=timeout)
+            document = _normalize_document(raw, fallback_url=url)
+            if not document.get("content") and not document.get("error"):
+                raw = await self._post_json("/md", {"url": url, "f": "raw"}, timeout=timeout)
+                document = _normalize_document(raw, fallback_url=url)
+        if not document or not (document.get("content") or document.get("error")):
+            return _error_document(url, "Crawl4AI returned no document")
+        return await self._secure_document(document, url)
 
-        payload = {
-            "urls": [url],
-            "browser_config": {
-                "type": "BrowserConfig",
-                "params": {"headless": True},
-            },
-            "crawler_config": {
-                "type": "CrawlerRunConfig",
-                "params": {
-                    "cache_mode": "bypass",
-                    "deep_crawl_strategy": {
-                        "type": "BFSDeepCrawlStrategy",
-                        "params": {
-                            "max_depth": max_depth,
-                            "max_pages": max_pages,
-                            "include_external": False,
+    async def crawl4ai_crawl_tool(self, args: dict[str, Any], **_: Any) -> str:
+        """Run a bounded deep crawl without adding a core Hermes tool."""
+        try:
+            url = normalize_url_for_request(str(args.get("url") or "").strip())
+            if not url:
+                return json.dumps({"success": False, "error": "A URL is required"})
+            error = await _target_error(url)
+            if error:
+                return json.dumps({"success": False, "error": error, "url": url})
+
+            depth = "advanced" if args.get("depth") == "advanced" else "basic"
+            max_pages = max(1, min(int(args.get("max_pages", 10)), MAX_CRAWL_PAGES))
+            max_depth = 2 if depth == "advanced" else 1
+            timeout = self._bounded_int("crawl_timeout_seconds", 180, 30, 300)
+
+            payload = {
+                "urls": [url],
+                "browser_config": {
+                    "type": "BrowserConfig",
+                    "params": {"headless": True},
+                },
+                "crawler_config": {
+                    "type": "CrawlerRunConfig",
+                    "params": {
+                        "cache_mode": "bypass",
+                        "deep_crawl_strategy": {
+                            "type": "BFSDeepCrawlStrategy",
+                            "params": {
+                                "max_depth": max_depth,
+                                "max_pages": max_pages,
+                                "include_external": False,
+                            },
                         },
                     },
                 },
-            },
-        }
-        raw = await _post_json("/crawl", payload, timeout=timeout)
-        documents = _normalize_documents(raw, fallback_url=url)[:max_pages]
-        same_site_documents = []
-        for document in documents:
-            candidate_url = str(document.get("url") or url)
-            if _is_same_site(url, candidate_url):
-                same_site_documents.append(document)
-            else:
-                same_site_documents.append(
-                    _error_document(candidate_url, "Blocked: crawl result left the seed site")
-                )
-        secured = await asyncio.gather(
-            *(_secure_document(document, url) for document in same_site_documents)
-        )
-        return json.dumps({"results": list(secured)}, ensure_ascii=False)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - tool errors are returned to the model
-        safe_url = locals().get("url", str(args.get("url") or ""))
-        logger.warning("Crawl4AI crawl failed for %s: %s", safe_url, exc)
-        return json.dumps(
-            {"success": False, "error": f"Crawl4AI crawl failed: {exc}", "url": safe_url},
-            ensure_ascii=False,
-        )
+            }
+            raw = await self._post_json("/crawl", payload, timeout=timeout)
+            documents = _normalize_documents(raw, fallback_url=url)[:max_pages]
+            same_site_documents = []
+            for document in documents:
+                candidate_url = str(document.get("url") or url)
+                if _is_same_site(url, candidate_url):
+                    same_site_documents.append(document)
+                else:
+                    same_site_documents.append(
+                        _error_document(candidate_url, "Blocked: crawl result left the seed site")
+                    )
+            secured = await asyncio.gather(
+                *(self._secure_document(document, url) for document in same_site_documents)
+            )
+            return json.dumps({"results": list(secured)}, ensure_ascii=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - tool errors are returned to the model
+            safe_url = locals().get("url", str(args.get("url") or ""))
+            logger.warning("Crawl4AI crawl failed for %s: %s", safe_url, exc)
+            return json.dumps(
+                {"success": False, "error": f"Crawl4AI crawl failed: {exc}", "url": safe_url},
+                ensure_ascii=False,
+            )

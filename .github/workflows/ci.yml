@@ -22,7 +22,7 @@ jobs:
           path: hermes-agent
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: "3.11"
+          python-version: "3.14"
           cache: pip
       - name: Install Hermes and plugin test dependencies
         run: |
@@ -31,7 +31,16 @@ jobs:
           python -m pip install -e './hermes-web-crawl4ai[dev]'
       - name: Test
         working-directory: hermes-web-crawl4ai
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-plugin-test
         run: pytest -q
+      - name: Check Hermes plugin compatibility
+        working-directory: hermes-web-crawl4ai
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-plugin-check
+        run: |
+          hermes plugins doctor . --ci
+          hermes plugins validate .
       - name: Lint
         working-directory: hermes-web-crawl4ai
         run: ruff check .
@@ -59,7 +68,7 @@ jobs:
           path: hermes-agent
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: "3.11"
+          python-version: "3.14"
           cache: pip
       - name: Install test dependencies
         run: |
