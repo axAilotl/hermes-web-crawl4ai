@@ -1,0 +1,29 @@
+name: Live service test
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: plugin
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: NousResearch/hermes-agent
+          ref: v0.23.0
+          path: hermes-agent
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.14"
+      - name: Install test harness
+        working-directory: plugin
+        run: |
+          python -m pip install --no-deps -e ../hermes-agent
+          python -m pip install -r tests/requirements-host.txt '.[dev]'
+      - name: Test against disposable official service
+        working-directory: plugin
+        run: python tests/run_live.py

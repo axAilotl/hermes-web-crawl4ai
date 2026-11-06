@@ -3,6 +3,7 @@ version: 0.2.0
 description: "Self-hosted Crawl4AI extraction backend and bounded crawl tool for Hermes."
 author: axAilotl
 kind: backend
+requires_hermes: ">=0.23.0"
 provides_web_providers:
   - crawl4ai
 provides_tools:
@@ -10,6 +11,10 @@ provides_tools:
 python_dependencies:
   - "httpx>=0.27,<1"
 config_schema:
+  api_token:
+    type: secret
+    env: CRAWL4AI_API_TOKEN
+    description: "Optional Bearer token, stored by Hermes in the active profile secret store."
   api_url:
     type: str
     description: "Crawl4AI service URL; falls back to CRAWL4AI_URL."

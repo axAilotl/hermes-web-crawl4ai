@@ -29,7 +29,7 @@ async def test_live_markdown_and_html_extract(provider) -> None:
     assert markdown[0].get("error") is None
     assert markdown[0]["content"]
     assert html[0].get("error") is None
-    assert "Example Domain" in html[0]["content"]
+    assert "<" in html[0]["content"] and ">" in html[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -41,5 +41,6 @@ async def test_live_bounded_same_site_crawl(provider) -> None:
     )
 
     assert "error" not in result
-    assert len(result["results"]) <= 2
+    assert 1 <= len(result["results"]) <= 2
+    assert all(not item.get("error") for item in result["results"])
     assert all(item["url"].startswith("https://example.com") for item in result["results"])

@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import deque
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urldefrag, urljoin, urlparse
 
 import httpx
 from agent.web_search_provider import WebSearchProvider, get_provider_env
@@ -321,42 +322,70 @@ class Crawl4AIWebSearchProvider(WebSearchProvider):
             max_depth = 2 if depth == "advanced" else 1
             timeout = self._bounded_int("crawl_timeout_seconds", 180, 30, 300)
 
-            payload = {
-                "urls": [url],
-                "browser_config": {
-                    "type": "BrowserConfig",
-                    "params": {"headless": True},
-                },
-                "crawler_config": {
-                    "type": "CrawlerRunConfig",
-                    "params": {
-                        "cache_mode": "bypass",
-                        "deep_crawl_strategy": {
-                            "type": "BFSDeepCrawlStrategy",
-                            "params": {
-                                "max_depth": max_depth,
-                                "max_pages": max_pages,
-                                "include_external": False,
-                            },
+            # Crawl4AI 0.9+ rejects server-side deep_crawl_strategy in untrusted
+            # requests. Follow links here so every page is bounded and policy-checked
+            # BEFORE it is handed to the service (also works with 0.8.9).
+            pending = deque([(url, 0)])
+            seen = {urldefrag(url)[0]}
+            results = []
+            async with asyncio.timeout(timeout):
+                while pending and len(results) < max_pages:
+                    target, level = pending.popleft()
+                    policy_error = await _target_error(target)
+                    if policy_error:
+                        results.append(_error_document(target, policy_error))
+                        continue
+                    payload = {
+                        "urls": [target],
+                        "browser_config": {"type": "BrowserConfig", "params": {"headless": True}},
+                        "crawler_config": {
+                            "type": "CrawlerRunConfig",
+                            "params": {"cache_mode": "bypass"},
                         },
-                    },
-                },
-            }
-            raw = await self._post_json("/crawl", payload, timeout=timeout)
-            documents = _normalize_documents(raw, fallback_url=url)[:max_pages]
-            same_site_documents = []
-            for document in documents:
-                candidate_url = str(document.get("url") or url)
-                if _is_same_site(url, candidate_url):
-                    same_site_documents.append(document)
-                else:
-                    same_site_documents.append(
-                        _error_document(candidate_url, "Blocked: crawl result left the seed site")
-                    )
-            secured = await asyncio.gather(
-                *(self._secure_document(document, url) for document in same_site_documents)
-            )
-            return json.dumps({"results": list(secured)}, ensure_ascii=False)
+                    }
+                    try:
+                        raw = await self._post_json("/crawl", payload, timeout=timeout)
+                        documents = _normalize_documents(raw, fallback_url=target)
+                        document = (
+                            documents[0]
+                            if documents
+                            else _error_document(target, "Crawl4AI returned no document")
+                        )
+                        if not _is_same_site(url, document.get("url") or target):
+                            document = _error_document(
+                                target, "Blocked: crawl result left the seed site"
+                            )
+                        document = await self._secure_document(document, target)
+                    except (httpx.HTTPError, ValueError) as exc:
+                        results.append(_error_document(target, f"Crawl4AI request failed: {exc}"))
+                        continue
+                    results.append(document)
+                    if document.get("error") or level >= max_depth:
+                        continue
+                    items = raw.get("results", raw.get("result", []))
+                    item = items[0] if isinstance(items, list) and items else {}
+                    links = item.get("links") if isinstance(item, dict) else None
+                    links = links.get("internal", []) if isinstance(links, dict) else []
+                    if not isinstance(links, list):
+                        continue
+                    for link in links:
+                        href = link.get("href") if isinstance(link, dict) else link
+                        if not isinstance(href, str) or not href.strip():
+                            continue
+                        try:
+                            candidate = urldefrag(
+                                normalize_url_for_request(urljoin(document["url"], href))
+                            )[0]
+                        except ValueError:
+                            continue
+                        if candidate in seen or not _is_same_site(url, candidate):
+                            continue
+                        # Limit the queue as well as fetches; a page may contain thousands of links.
+                        if len(seen) >= max_pages:
+                            break
+                        seen.add(candidate)
+                        pending.append((candidate, level + 1))
+            return json.dumps({"results": results}, ensure_ascii=False)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - tool errors are returned to the model

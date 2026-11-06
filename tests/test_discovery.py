@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,13 @@ def test_real_hermes_directory_discovery(tmp_path, monkeypatch, settings_key) ->
     hermes_home = tmp_path / "hermes"
     plugins_dir = hermes_home / "plugins"
     plugins_dir.mkdir(parents=True)
-    (plugins_dir / "hermes-web-crawl4ai").symlink_to(repo_root, target_is_directory=True)
+    shutil.copytree(
+        repo_root,
+        plugins_dir / "hermes-web-crawl4ai",
+        ignore=shutil.ignore_patterns(
+            ".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache"
+        ),
+    )
     (hermes_home / "config.yaml").write_text(
         yaml.safe_dump(
             {

@@ -11,72 +11,51 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            hermes: v0.23.0
+          - os: windows-latest
+            hermes: v0.23.0
+          - os: macos-latest
+            hermes: v0.23.0
+          - os: ubuntu-latest
+            hermes: main
+    runs-on: ${{ matrix.os }}
+    env:
+      HERMES_HOME: ${{ runner.temp }}/hermes-plugin-test
+    defaults:
+      run:
+        shell: bash
+        working-directory: plugin
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          path: hermes-web-crawl4ai
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+          path: plugin
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes }}
           path: hermes-agent
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version: "3.14"
-          cache: pip
-      - name: Install Hermes and plugin test dependencies
+      - name: Install plugin and isolated host test harness
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ./hermes-agent
-          python -m pip install -e './hermes-web-crawl4ai[dev]'
-      - name: Test
-        working-directory: hermes-web-crawl4ai
-        env:
-          HERMES_HOME: ${{ runner.temp }}/hermes-plugin-test
-        run: pytest -q
-      - name: Check Hermes plugin compatibility
-        working-directory: hermes-web-crawl4ai
-        env:
-          HERMES_HOME: ${{ runner.temp }}/hermes-plugin-check
+          python -m pip install --no-deps -e ../hermes-agent
+          python -m pip install -r tests/requirements-host.txt '.[dev]' build
+      - name: Test and lint
+        run: |
+          python -m pytest -q
+          ruff check .
+      - name: Validate native plugin
         run: |
           hermes plugins doctor . --ci
           hermes plugins validate .
-      - name: Lint
-        working-directory: hermes-web-crawl4ai
-        run: ruff check .
-
-  live-crawl4ai:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    services:
-      crawl4ai:
-        image: unclecode/crawl4ai@sha256:b243f684ad20f71ee108ab3fc3f31f3349eb5b31a9947b9e563d868417141aad # 0.8.9
-        ports:
-          - 11235:11235
-        options: >-
-          --health-cmd "curl --fail http://localhost:11235/health || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 18
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          path: hermes-web-crawl4ai
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: NousResearch/hermes-agent
-          path: hermes-agent
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: "3.14"
-          cache: pip
-      - name: Install test dependencies
+      - name: Build and verify installed wheel
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ./hermes-agent
-          python -m pip install -e './hermes-web-crawl4ai[dev]'
-      - name: Run real-service contract tests
-        working-directory: hermes-web-crawl4ai
-        env:
-          CRAWL4AI_TEST_URL: http://localhost:11235
-        run: pytest -q tests/test_live_crawl4ai.py
+          python -m build
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          python -I tests/smoke_installed.py

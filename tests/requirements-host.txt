@@ -1,0 +1,10 @@
+# Minimal Hermes runtime needed for plugin loader/doctor tests, not a full agent install.
+# Keep the host checkout separate: pip install --no-deps -e ../hermes-agent
+python-dotenv>=1,<2
+ruamel.yaml>=0.18,<0.20
+rich>=13,<16
+requests>=2.32,<3
+tenacity>=9,<10
+platformdirs>=4,<5
+packaging>=24,<27
+pydantic>=2,<3

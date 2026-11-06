@@ -148,45 +148,66 @@ async def test_crawl_tool_rejects_unsafe_seed(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.asyncio
-async def test_crawl_tool_clamps_depth_pages_and_filters_results(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_crawl_tool_clamps_pages_and_checks_each_request(monkeypatch):
     monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
     provider = Crawl4AIWebSearchProvider()
-    post = AsyncMock(
-        return_value={
+
+    async def respond(path, payload, *, timeout):
+        assert "deep_crawl_strategy" not in payload["crawler_config"]["params"]
+        target = payload["urls"][0]
+        links = [{"href": f"https://example.com/{i}"} for i in range(100)]
+        return {
             "results": [
-                {
-                    "url": f"https://example.com/{index}",
-                    "metadata": {"title": str(index)},
-                    "markdown": f"page {index}",
-                    "success": True,
-                }
-                for index in range(25)
+                {"url": target, "markdown": "page", "success": True, "links": {"internal": links}}
             ]
         }
-    )
-    monkeypatch.setattr(provider, "_post_json", post)
 
+    post = AsyncMock(side_effect=respond)
+    monkeypatch.setattr(provider, "_post_json", post)
     result = json.loads(
         await provider.crawl4ai_crawl_tool(
-            {"url": "https://example.com/docs", "depth": "advanced", "max_pages": 999}
+            {"url": "https://example.com", "depth": "advanced", "max_pages": 999}
         )
     )
-
-    payload = post.await_args.args[1]
-    assert payload["browser_config"] == {
-        "type": "BrowserConfig",
-        "params": {"headless": True},
-    }
-    assert payload["crawler_config"]["type"] == "CrawlerRunConfig"
-    strategy = payload["crawler_config"]["params"]["deep_crawl_strategy"]
-    assert strategy["params"] == {
-        "max_depth": 2,
-        "max_pages": 20,
-        "include_external": False,
-    }
     assert len(result["results"]) == 20
+    assert post.await_count == 20
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("depth,count", [("basic", 2), ("advanced", 3)])
+async def test_crawl_depth_and_cycles(monkeypatch, depth, count):
+    monkeypatch.setattr(provider_module, "_target_error", AsyncMock(return_value=None))
+    provider = Crawl4AIWebSearchProvider()
+
+    async def respond(path, payload, *, timeout):
+        target = payload["urls"][0]
+        level = int(target.rsplit("/", 1)[1])
+        return {
+            "results": [
+                {
+                    "url": target,
+                    "markdown": "page",
+                    "links": {
+                        "internal": [
+                            {"href": f"/{level + 1}"},
+                            {"href": "/0#again"},
+                            {"href": "http://127.0.0.1/private"},
+                            {"href": "https://unrelated.example"},
+                        ]
+                    },
+                }
+            ]
+        }
+
+    post = AsyncMock(side_effect=respond)
+    monkeypatch.setattr(provider, "_post_json", post)
+    result = json.loads(
+        await provider.crawl4ai_crawl_tool({"url": "https://example.com/0", "depth": depth})
+    )
+    assert [r["url"] for r in result["results"]] == [
+        f"https://example.com/{i}" for i in range(count)
+    ]
+    assert post.await_count == count
 
 
 @pytest.mark.asyncio
