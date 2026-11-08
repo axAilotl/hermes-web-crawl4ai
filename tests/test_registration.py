@@ -23,7 +23,7 @@ def test_registers_provider_and_plugin_local_crawl_tool() -> None:
 
     register(context)
 
-    assert [provider.name for provider in context.providers] == ["crawl4ai"]
+    assert [provider.name for provider in context.providers] == ["crawl4ai-bounded"]
     assert [tool["name"] for tool in context.tools] == ["crawl4ai_crawl"]
     tool = context.tools[0]
     assert tool["toolset"] == "crawl4ai"

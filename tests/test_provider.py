@@ -51,7 +51,7 @@ def test_normalize_documents_accepts_known_list_envelopes(key: str) -> None:
 def test_provider_is_extract_only(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = Crawl4AIWebSearchProvider({"api_url": "http://localhost:11235"}.get)
 
-    assert provider.name == "crawl4ai"
+    assert provider.name == "crawl4ai-bounded"
     assert provider.supports_search() is False
     assert provider.supports_extract() is True
     assert provider.is_available() is True

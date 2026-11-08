@@ -180,7 +180,7 @@ class Crawl4AIWebSearchProvider(WebSearchProvider):
 
     @property
     def name(self) -> str:
-        return "crawl4ai"
+        return "crawl4ai-bounded"
 
     @property
     def display_name(self) -> str:

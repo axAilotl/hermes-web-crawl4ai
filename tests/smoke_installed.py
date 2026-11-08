@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory() as temporary:
                     "enabled": [PLUGIN],
                     "entries": {PLUGIN: {"settings": {"api_url": "http://localhost:12345"}}},
                 },
-                "web": {"extract_backend": "crawl4ai"},
+                "web": {"extract_backend": "crawl4ai-bounded"},
             }
         ),
         encoding="utf-8",
@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory() as temporary:
         loaded = manager._plugins[PLUGIN]
         assert loaded.enabled and not loaded.error, loaded.error
         provider = web_search_registry.get_active_extract_provider()
-        assert provider.name == "crawl4ai" and provider.is_available()
+        assert provider.name == "crawl4ai-bounded" and provider.is_available()
         print(f"Installed wheel discovered and selected: {PLUGIN}")
     finally:
         manager.unload()

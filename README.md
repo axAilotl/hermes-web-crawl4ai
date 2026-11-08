@@ -42,7 +42,7 @@ plugins:
         api_url: http://localhost:11235
 
 web:
-  extract_backend: crawl4ai
+  extract_backend: crawl4ai-bounded
 ```
 
 Replace `localhost` when the service runs elsewhere. If Hermes itself runs in
@@ -79,9 +79,10 @@ boundary. Every queued URL is checked against Hermes' URL and website policies
 before fetching; returned redirect URLs are checked again. One failed page
 becomes an error entry. Cancellation propagates, and the overall crawl has a deadline.
 
-Do not enable another plugin registering the `crawl4ai` backend at the same
-time. This repository is independent of the existing catalog plugin named
-`crawl4ai`; it also provides bounded crawling and profile settings.
+The extraction backend ID is `crawl4ai-bounded`, distinct from the existing
+catalog plugin's `crawl4ai` backend. Select `web.extract_backend` explicitly
+when both are installed. This plugin also provides bounded crawling and
+profile settings.
 
 ## Use both plugins together
 
@@ -108,7 +109,7 @@ plugins:
         api_url: http://localhost:11235
 web:
   search_backend: searxng-local
-  extract_backend: crawl4ai
+  extract_backend: crawl4ai-bounded
 ```
 
 Neither plugin requires the other. You can pair either with another provider.
@@ -174,8 +175,12 @@ single-page endpoints.
 
 ## Migration and compatibility
 
-Version 0.2.0 keeps backend `crawl4ai`, tool `crawl4ai_crawl`, and the existing
-secret name. Settings use `ctx.get_config()` and the `settings` subtree;
+The extraction backend is now `crawl4ai-bounded` to avoid a collision with the
+existing catalog plugin. When upgrading, change `web.extract_backend: crawl4ai`
+(or `web.backend: crawl4ai`) to `crawl4ai-bounded` in your active profile. The
+`crawl4ai` ID is not registered as an alias, so it remains available to the other
+plugin. Tool `crawl4ai_crawl`, toolset `crawl4ai`, and the existing secret name
+are unchanged. Settings use `ctx.get_config()` and the `settings` subtree;
 Hermes accepts the old `config` subtree as a fallback. `settings` wins when both
 provide a key. Configuration is read when used rather than cached across profiles.
 
